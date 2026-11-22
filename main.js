@@ -32,25 +32,87 @@ import {
 } from "./average_shaders.js";
 
 import { OrbitCamera } from "./camera.js";
+import { createUI } from "./ui.js";
 
 
-// 최대 서브디비전 레벨 (vertexBuffer 크기도 이 레벨 기준)
-const MAX_LEVEL = 3;
+// ============================================================
+// 설정
+// ============================================================
+
+const MAX_LEVEL = 3;                       // 최대 서브디비전 레벨
+const FREE_COMPUTE_BUFFERS = true;         // 계산이 끝나면 계산 전용 버퍼를 해제해 메모리 절약
+
+const DATA_PATH = {
+    vtk: "./src/newA/big_A2.vtk",
+    topology: "./src/newA/irregular_topology.json",
+};
+
+const RENDER_SHADER = /* wgsl */ `
+    struct VSOut {
+        @builtin(position) position: vec4<f32>,
+    };
+
+    struct Uniforms {
+        mvp : mat4x4<f32>,
+    };
+
+    struct Settings {
+        faceColor : vec4<f32>,
+        wireColor : vec4<f32>,
+    };
+
+    @group(0) @binding(0) var<storage, read> pos : array<vec4<f32>>;
+    @group(0) @binding(1) var<uniform> uniforms : Uniforms;
+    @group(0) @binding(2) var<uniform> settings : Settings;
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VSOut {
+        var out: VSOut;
+        let p = pos[vertexIndex].xyz * 0.3;
+        out.position = uniforms.mvp * vec4f(p, 1.0);
+        return out;
+    }
+
+    @fragment
+    fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+        return settings.faceColor;
+    }
+
+    @fragment
+    fn fs_wire(in: VSOut) -> @location(0) vec4<f32> {
+        return settings.wireColor;
+    }
+`;
 
 
-async function init() {
+// ============================================================
+// 유틸
+// ============================================================
 
+const range = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+// 객체 안에 중첩된 GPUBuffer 를 모두 해제
+function destroyBuffers(resource) {
+    if (resource instanceof GPUBuffer) {
+        resource.destroy();
+    } else if (resource && typeof resource === "object") {
+        Object.values(resource).forEach(destroyBuffers);
+    }
+}
+
+
+// ============================================================
+// WebGPU 초기화
+// ============================================================
+
+async function initGPU(canvas) {
     if (!navigator.gpu) {
         alert("WebGPU not supported");
-        return;
+        throw new Error("WebGPU not supported");
     }
 
     const adapter = await navigator.gpu.requestAdapter();
-
-    if (!adapter) {
-        console.error("Failed to get GPU adapter");
-        return;
-    }
+    if (!adapter) throw new Error("Failed to get GPU adapter");
 
     const device = await adapter.requestDevice();
 
@@ -59,491 +121,283 @@ async function init() {
         console.error("WebGPU uncaptured error:", e.error.message);
     });
 
-
-    const canvas = document.getElementById("gpuCanvas");
     const context = canvas.getContext("webgpu");
     const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format, alphaMode: "opaque" });
 
-    context.configure({
-        device,
-        format,
-        alphaMode: "opaque"
-    });
+    return { device, context, format };
+}
 
 
-    // Uniform buffer (MVP)
-    const uniformBuffer = device.createBuffer({
-        size: 64,
-        usage:
-            GPUBufferUsage.UNIFORM |
-            GPUBufferUsage.COPY_DST
-    });
+// ============================================================
+// 레벨별 리소스
+//   compute : 계산에만 쓰는 버퍼 (계산 후 해제 가능)
+//   render  : 화면에 그릴 때 쓰는 index buffer
+// ============================================================
 
+async function createLevelResources(device, vertices, topology, level) {
 
-    // ------------------------------------------------------------
-    // UI 설정값 + 색상 uniform buffer (faceColor vec4 + wireColor vec4 = 32 bytes)
-    // ------------------------------------------------------------
-    const settingsBuffer = device.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-    });
+    const [
+        levelInfo, edge, face, cell,
+        faceCenter, cellCenter,
+        boundaryAvg, avg,
+        faceIndex, edgeIndex,
+    ] = await Promise.all([
+        createLevelInfoBuffer(device, vertices, topology, level),
+        createEdgeBuffer(device, topology, level),
+        createFaceBuffer(device, topology, level),
+        createCellBuffer(device, topology, level),
+        createMaxFaceBuffer(device, topology, level),
+        createMaxCellBuffer(device, topology, level),
+        createBoundaryAverageBuffer(device, topology, level),
+        createAverageBuffer(device, topology, level),
+        createIndexBuffer(device, topology, level),
+        createEdgeIndexBuffer(device, topology, level),
+    ]);
 
-    const settings = {
-        showFaces: true,
-        showWire: true,
-        faceColor: [1, 0.7, 0],
-        wireColor: [0.2, 0.2, 0.2],
-        bgColor: [0.5, 0.5, 0.5],
-    };
-
-    function hexToRgb(hex) {
-        return [
-            parseInt(hex.slice(1, 3), 16) / 255,
-            parseInt(hex.slice(3, 5), 16) / 255,
-            parseInt(hex.slice(5, 7), 16) / 255,
-        ];
-    }
-
-    function writeSettings() {
-        device.queue.writeBuffer(settingsBuffer, 0, new Float32Array([
-            ...settings.faceColor, 1,
-            ...settings.wireColor, 1,
-        ]));
-    }
-    writeSettings();
-
-
-    // Load VTK / topology
-    const vertices = await loadVTK("./src/newA/big_A2.vtk");
-    const irr_topology = await loadJSON("./src/newA/irregular_topology.json");
-
-
-    // 모든 레벨이 공유하는 작업용 정점 버퍼 (최대 레벨 크기)
-    // 주의: createVertexBuffer 안에서 usage 에 GPUBufferUsage.COPY_SRC 가 포함되어 있어야 함
-    const V = await countVertex(irr_topology, MAX_LEVEL, vertices.length);
-
-    const vertexBuffer = await createVertexBuffer(device, vertices, irr_topology, MAX_LEVEL, V);
-
-
-    // ------------------------------------------------------------
-    // 레벨별 리소스 (subdiv + center + average + 렌더링 index 전부 레벨 기준)
-    // ------------------------------------------------------------
-    async function createLevelResources(level) {
-
-        const levelInfo = await createLevelInfoBuffer(device, vertices, irr_topology, level);
-        const edge = await createEdgeBuffer(device, irr_topology, level);
-        const face = await createFaceBuffer(device, irr_topology, level);
-        const cell = await createCellBuffer(device, irr_topology, level);
-
-        const { MaxFaceBuffer, FaceCenteryBuffer } = await createMaxFaceBuffer(device, irr_topology, level);
-        const { MaxCellBuffer, CellCenteryBuffer } = await createMaxCellBuffer(device, irr_topology, level);
-
-        const boundaryAvg = await createBoundaryAverageBuffer(device, irr_topology, level);
-        const avg = await createAverageBuffer(device, irr_topology, level);
-
-        // 렌더링용 index buffer (레벨별)
-        const { indexBuffer, indexCount } = await createIndexBuffer(device, irr_topology, level);
-
-        const { indexBuffer: edgeIndexBuffer, indexCount: edgeIndexCount } =
-            await createEdgeIndexBuffer(device, irr_topology, level);
-
-        return {
-            level,
-            levelInfo,
-            edge,
-            face,
-            cell,
-            MaxFaceBuffer,
-            FaceCenteryBuffer,
-            MaxCellBuffer,
-            CellCenteryBuffer,
+    return {
+        level,
+        compute: {
+            levelInfo, edge, face, cell,
+            faceCenter,      // { MaxFaceBuffer, FaceCenteryBuffer }
+            cellCenter,      // { MaxCellBuffer, CellCenteryBuffer }
             boundaryAvg,
             avg,
-            indexBuffer,
-            indexCount,
-            edgeIndexBuffer,
-            edgeIndexCount
-        };
+        },
+        render: {
+            indexBuffer: faceIndex.indexBuffer,
+            indexCount: faceIndex.indexCount,
+            edgeIndexBuffer: edgeIndex.indexBuffer,
+            edgeIndexCount: edgeIndex.indexCount,
+        },
+    };
+}
+
+
+// ============================================================
+// 서브디비전 실행
+//   레벨마다: edge -> face -> cell -> face center -> cell center
+//             -> boundary average -> vertex average -> (스냅샷 복사)
+//
+// 주의: subdivision_shaders.js / average_shaders.js 의 함수들은
+//       pass.end() 를 호출하지 않아야 한다 (여기서 end() 한다).
+// ============================================================
+
+function runSubdivision(device, vertexBuffer, levels, snapshots, levelVertexCounts) {
+    const encoder = device.createCommandEncoder();
+
+    // compute pass 하나를 열고, 작업을 넣고, 닫는다
+    const computePass = (work) => {
+        const pass = encoder.beginComputePass();
+        work(pass);
+        pass.end();
+    };
+
+    for (const { level, compute: c } of levels) {
+
+        computePass((p) => subdiv_edge(device, p, vertexBuffer, c.edge, c.levelInfo));
+        computePass((p) => subdiv_face(device, p, vertexBuffer, c.face, c.levelInfo));
+        computePass((p) => subdiv_cell(device, p, vertexBuffer, c.cell, c.levelInfo));
+
+        computePass((p) => maxLevelFaceCentery(
+            device, p, vertexBuffer,
+            c.faceCenter.MaxFaceBuffer, c.faceCenter.FaceCenteryBuffer
+        ));
+
+        computePass((p) => maxLevelCellCentery(
+            device, p, vertexBuffer,
+            c.cellCenter.MaxCellBuffer, c.cellCenter.CellCenteryBuffer
+        ));
+
+        computePass((p) => boundaryAverage(
+            device, p,
+            c.boundaryAvg.BoundaryAverageData_idxData,
+            c.boundaryAvg.BoundaryAverageData_start,
+            c.boundaryAvg.BoundaryAverageData_count,
+            c.boundaryAvg.BoundaryAverageData_faceIdx,
+            c.faceCenter.FaceCenteryBuffer,
+            vertexBuffer
+        ));
+
+        computePass((p) => vertexAverage(
+            device, p,
+            c.avg.AverageData_idxData,
+            c.avg.AverageData_start,
+            c.avg.AverageData_count,
+            c.avg.AverageData_cellIdx,
+            c.cellCenter.CellCenteryBuffer,
+            vertexBuffer
+        ));
+
+        // 이 레벨의 결과를 스냅샷으로 저장 (마지막 레벨은 작업 버퍼를 그대로 사용)
+        const i = level - 1;
+        if (snapshots[i] !== vertexBuffer) {
+            encoder.copyBufferToBuffer(vertexBuffer, 0, snapshots[i], 0, levelVertexCounts[i] * 16);
+        }
     }
 
-    // levels[0] = 레벨 1, levels[1] = 레벨 2, ...
-    const levels = [];
-    for (let lv = 1; lv <= MAX_LEVEL; lv++) {
-        levels.push(await createLevelResources(lv));
-    }
+    device.queue.submit([encoder.finish()]);
+}
 
 
-    // ------------------------------------------------------------
-    // 레벨별 정점 스냅샷 (슬라이더로 레벨을 전환해서 보기 위함)
-    // 레벨 k 계산이 끝난 직후의 정점 [0, count_k) 을 복사해 둔다.
-    // 마지막 레벨은 작업 버퍼를 그대로 사용한다.
-    // ------------------------------------------------------------
-    const levelVertexCounts = [];
-    for (let lv = 1; lv <= MAX_LEVEL; lv++) {
-        levelVertexCounts.push(await countVertex(irr_topology, lv, vertices.length));
-    }
+// ============================================================
+// 렌더링 파이프라인 / bind group
+// ============================================================
 
-    const levelVertexBuffers = levels.map((L, i) => {
-        if (i === MAX_LEVEL - 1) return vertexBuffer;
+function createRenderer(device, format, uniformBuffer, settingsBuffer, snapshots) {
+    const shader = device.createShaderModule({ code: RENDER_SHADER });
 
-        return device.createBuffer({
-            size: levelVertexCounts[i] * 16,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-        });
+    const bindGroupLayout = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.VERTEX,   buffer: { type: "read-only-storage" } },
+            { binding: 1, visibility: GPUShaderStage.VERTEX,   buffer: { type: "uniform" } },
+            { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        ],
     });
 
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
 
-    // Render shader
-    const shader = device.createShaderModule({
-        code: `
-            struct VSOut {
-                @builtin(position) position: vec4<f32>,
-            };
-
-            struct Uniforms {
-                mvp : mat4x4<f32>,
-            };
-
-            struct Settings {
-                faceColor : vec4<f32>,
-                wireColor : vec4<f32>,
-            };
-
-
-            @group(0) @binding(0) var<storage, read> pos : array<vec4<f32>>;
-            @group(0) @binding(1) var<uniform> uniforms : Uniforms;
-            @group(0) @binding(2) var<uniform> settings : Settings;
-
-
-            @vertex
-            fn vs_main(
-                @builtin(vertex_index) vertexIndex: u32
-            ) -> VSOut {
-                var out: VSOut;
-                let p = pos[vertexIndex].xyz * 0.3;
-                out.position = uniforms.mvp * vec4f(p, 1.0);
-                return out;
-            }
-
-
-            @fragment
-            fn fs_main( in: VSOut ) -> @location(0) vec4<f32> {
-                return settings.faceColor;
-            }
-
-            @fragment
-            fn fs_wire( in: VSOut ) -> @location(0) vec4<f32> {
-                return settings.wireColor;
-            }
-        `
-    });
-
-
-    // Render bind group layout
-    const bindGroupLayout =
-        device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0,
-                    visibility: GPUShaderStage.VERTEX,
-                    buffer: { type: "read-only-storage" },
-                },
-                {
-                    binding: 1,
-                    visibility: GPUShaderStage.VERTEX,
-                    buffer: { type: "uniform" },
-                },
-                {
-                    binding: 2,
-                    visibility: GPUShaderStage.FRAGMENT,
-                    buffer: { type: "uniform" },
-                },
-            ],
-        });
-
-
-    // Pipeline layout
-    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
-
-
-    // Triangle pipeline
-    const pipeline =
+    const makePipeline = (fragmentEntry, primitive) =>
         device.createRenderPipeline({
-
-            layout: pipelineLayout,
-
-            vertex: {
-                module: shader,
-                entryPoint: "vs_main"
-            },
-
-            fragment: {
-                module: shader,
-                entryPoint: "fs_main",
-                targets: [{ format }]
-            },
-
-            primitive: {
-                topology: "triangle-list",
-                cullMode: "none",
-            },
+            layout,
+            vertex: { module: shader, entryPoint: "vs_main" },
+            fragment: { module: shader, entryPoint: fragmentEntry, targets: [{ format }] },
+            primitive,
         });
 
-
-    // Wireframe pipeline
-    const wirePipeline =
-        device.createRenderPipeline({
-            layout: pipelineLayout,
-
-            vertex: {
-                module: shader,
-                entryPoint: "vs_main",
-            },
-
-            fragment: {
-                module: shader,
-                entryPoint: "fs_wire",
-                targets: [{ format }]
-            },
-
-            primitive: {
-                topology: "line-list",
-            },
-        });
-
-
-    // Render bind group (레벨마다 하나: 정점 버퍼만 다름)
-    const bindGroups = levelVertexBuffers.map((buf) =>
+    // 레벨마다 하나: 정점 버퍼만 다름
+    const bindGroups = snapshots.map((buffer) =>
         device.createBindGroup({
             layout: bindGroupLayout,
             entries: [
-                { binding: 0, resource: { buffer: buf } },
+                { binding: 0, resource: { buffer } },
                 { binding: 1, resource: { buffer: uniformBuffer } },
                 { binding: 2, resource: { buffer: settingsBuffer } },
-            ]
+            ],
         })
     );
 
-
-    // ------------------------------------------------------------
-    // 캔버스를 화면에 꽉 채우기
-    // CSS 크기(clientWidth/Height) x devicePixelRatio 로 실제 해상도를 맞춘다.
-    // ------------------------------------------------------------
-    function resizeCanvas() {
-        const dpr = window.devicePixelRatio || 1;
-        const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-        const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
-
-        if (canvas.width !== w || canvas.height !== h) {
-            canvas.width = w;
-            canvas.height = h;
-            return true;
-        }
-        return false;
-    }
-
-    resizeCanvas();
+    return {
+        facePipeline: makePipeline("fs_main", { topology: "triangle-list", cullMode: "none" }),
+        wirePipeline: makePipeline("fs_wire", { topology: "line-list" }),
+        bindGroups,
+    };
+}
 
 
-    // Camera (이동 / 회전 / 줌 지원)
+// ============================================================
+// 메인
+// ============================================================
+
+async function init() {
+
+    const canvas = document.getElementById("gpuCanvas");
+    const { device, context, format } = await initGPU(canvas);
+
+    // 데이터 로드
+    const [vertices, topology] = await Promise.all([
+        loadVTK(DATA_PATH.vtk),
+        loadJSON(DATA_PATH.topology),
+    ]);
+
+    // 정점 버퍼 (모든 레벨이 공유하는 작업 버퍼, 최대 레벨 크기)
+    // 주의: createVertexBuffer 의 usage 에 GPUBufferUsage.COPY_SRC 가 있어야 스냅샷 복사가 가능
+    const levelNumbers = range(1, MAX_LEVEL);
+    const levelVertexCounts = await Promise.all(
+        levelNumbers.map((lv) => countVertex(topology, lv, vertices.length))
+    );
+    const V = levelVertexCounts[MAX_LEVEL - 1];
+
+    const vertexBuffer = await createVertexBuffer(device, vertices, topology, MAX_LEVEL, V);
+
+    // 레벨별 리소스
+    const levels = await Promise.all(
+        levelNumbers.map((lv) => createLevelResources(device, vertices, topology, lv))
+    );
+
+    // 레벨별 정점 스냅샷 (슬라이더 전환용). 마지막 레벨은 작업 버퍼를 그대로 사용
+    const snapshots = levelNumbers.map((lv, i) =>
+        lv === MAX_LEVEL
+            ? vertexBuffer
+            : device.createBuffer({
+                size: levelVertexCounts[i] * 16,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            })
+    );
+
+    // UI (캔버스 크기, 색상 설정, 패널, FPS 전부 ui.js 에서 처리)
+    const ui = createUI({
+        device,
+        canvas,
+        maxLevel: MAX_LEVEL,
+        levelStats: levels.map((L, i) => ({
+            vertices: levelVertexCounts[i],
+            triangles: Math.floor(L.render.indexCount / 3),
+            edges: Math.floor(L.render.edgeIndexCount / 2),
+        })),
+    });
+
+    // 렌더링 준비
+    const uniformBuffer = device.createBuffer({
+        size: 64,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    const renderer = createRenderer(device, format, uniformBuffer, ui.settings.buffer, snapshots);
+
     const camera = new OrbitCamera(canvas, device, uniformBuffer);
+    ui.attachCamera(camera);
 
-    // 창 크기가 바뀌면 해상도와 종횡비 갱신
-    new ResizeObserver(() => {
-        if (resizeCanvas()) camera.update();
-    }).observe(canvas);
+    // 서브디비전 실행
+    runSubdivision(device, vertexBuffer, levels, snapshots, levelVertexCounts);
 
-
-    // ------------------------------------------------------------
-    // UI 이벤트 연결
-    // ------------------------------------------------------------
-    const $ = (id) => document.getElementById(id);
-
-    // 현재 표시 중인 레벨
-    let displayLevel = MAX_LEVEL;
-
-    function updateStats() {
-        const L = levels[displayLevel - 1];
-        $("stat-v").textContent = levelVertexCounts[displayLevel - 1].toLocaleString();
-        $("stat-t").textContent = Math.floor(L.indexCount / 3).toLocaleString();
-        $("stat-e").textContent = Math.floor(L.edgeIndexCount / 2).toLocaleString();
-        $("level-label").textContent = displayLevel;
+    // 계산이 끝나면 계산 전용 버퍼 해제 (렌더링에 쓰는 index buffer 와 정점 버퍼는 유지)
+    if (FREE_COMPUTE_BUFFERS) {
+        device.queue.onSubmittedWorkDone().then(() => {
+            levels.forEach((L) => destroyBuffers(L.compute));
+        });
     }
 
-    const slider = $("level-slider");
-    slider.min = 1;
-    slider.max = MAX_LEVEL;
-    slider.step = 1;
-    slider.value = displayLevel;
-
-    slider.addEventListener("input", (e) => {
-        displayLevel = Number(e.target.value);
-        updateStats();
-    });
-
-    updateStats();
-
-    $("chk-faces").addEventListener("change", (e) => { settings.showFaces = e.target.checked; });
-    $("chk-wire").addEventListener("change", (e) => { settings.showWire = e.target.checked; });
-
-    $("col-face").addEventListener("input", (e) => {
-        settings.faceColor = hexToRgb(e.target.value);
-        writeSettings();
-    });
-    $("col-wire").addEventListener("input", (e) => {
-        settings.wireColor = hexToRgb(e.target.value);
-        writeSettings();
-    });
-    $("col-bg").addEventListener("input", (e) => {
-        settings.bgColor = hexToRgb(e.target.value);
-    });
-
-    $("btn-reset").addEventListener("click", () => camera.reset());
-
-
-    // ------------------------------------------------------------
-    // 실행 순서 (레벨마다 한 세트)
-    //   edge -> face -> cell -> face center -> cell center
-    //   -> boundary average -> vertex average -> (스냅샷 복사)
-    //
-    // 주의: average_shaders.js 의 함수들은 pass.end() 를 하지 않아야 함
-    //       (아래에서 호출하는 쪽이 end() 를 한다)
-    // ------------------------------------------------------------
-    function runSubdivision() {
-        const encoder = device.createCommandEncoder();
-
-        for (const L of levels) {
-
-            // Edge subdivision
-            let pass = encoder.beginComputePass();
-            subdiv_edge(device, pass, vertexBuffer, L.edge, L.levelInfo);
-            pass.end();
-
-            // Face subdivision
-            pass = encoder.beginComputePass();
-            subdiv_face(device, pass, vertexBuffer, L.face, L.levelInfo);
-            pass.end();
-
-            // Cell subdivision
-            pass = encoder.beginComputePass();
-            subdiv_cell(device, pass, vertexBuffer, L.cell, L.levelInfo);
-            pass.end();
-
-            // Face center
-            pass = encoder.beginComputePass();
-            maxLevelFaceCentery(device, pass, vertexBuffer, L.MaxFaceBuffer, L.FaceCenteryBuffer);
-            pass.end();
-
-            // Cell center
-            pass = encoder.beginComputePass();
-            maxLevelCellCentery(device, pass, vertexBuffer, L.MaxCellBuffer, L.CellCenteryBuffer);
-            pass.end();
-
-            // Boundary vertex average
-            pass = encoder.beginComputePass();
-            boundaryAverage(
-                device,
-                pass,
-                L.boundaryAvg.BoundaryAverageData_idxData,
-                L.boundaryAvg.BoundaryAverageData_start,
-                L.boundaryAvg.BoundaryAverageData_count,
-                L.boundaryAvg.BoundaryAverageData_faceIdx,
-                L.FaceCenteryBuffer,
-                vertexBuffer
-            );
-            pass.end();
-
-            // Vertex average
-            pass = encoder.beginComputePass();
-            vertexAverage(
-                device,
-                pass,
-                L.avg.AverageData_idxData,
-                L.avg.AverageData_start,
-                L.avg.AverageData_count,
-                L.avg.AverageData_cellIdx,
-                L.CellCenteryBuffer,
-                vertexBuffer
-            );
-            pass.end();
-
-            // 이 레벨의 결과를 스냅샷으로 저장 (마지막 레벨은 작업 버퍼를 그대로 씀)
-            const i = L.level - 1;
-            if (i < MAX_LEVEL - 1) {
-                encoder.copyBufferToBuffer(
-                    vertexBuffer, 0,
-                    levelVertexBuffers[i], 0,
-                    levelVertexCounts[i] * 16
-                );
-            }
-        }
-
-        device.queue.submit([encoder.finish()]);
-    }
-
-
-    // Render (슬라이더로 선택한 레벨)
+    // 렌더 루프
     function render() {
-
-        const L = levels[displayLevel - 1];
-        const bindGroup = bindGroups[displayLevel - 1];
-        const [r, g, b] = settings.bgColor;
+        const i = ui.state.displayLevel - 1;
+        const { indexBuffer, indexCount, edgeIndexBuffer, edgeIndexCount } = levels[i].render;
+        const bindGroup = renderer.bindGroups[i];
+        const { showFaces, showWire, bgColor: [r, g, b] } = ui.settings.values;
 
         const encoder = device.createCommandEncoder();
+        const pass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: context.getCurrentTexture().createView(),
+                clearValue: { r, g, b, a: 1 },
+                loadOp: "clear",
+                storeOp: "store"
+            }]
+        });
 
-        const pass =
-            encoder.beginRenderPass({
-                colorAttachments: [{
-                    view: context.getCurrentTexture().createView(),
-                    clearValue: { r, g, b, a: 1 },
-                    loadOp: "clear",
-                    storeOp: "store"
-                }]
-            });
-
-
-        // Triangle
-        if (settings.showFaces) {
-            pass.setPipeline(pipeline);
+        if (showFaces) {
+            pass.setPipeline(renderer.facePipeline);
             pass.setBindGroup(0, bindGroup);
-            pass.setIndexBuffer(L.indexBuffer, "uint32");
-            pass.drawIndexed(L.indexCount);
+            pass.setIndexBuffer(indexBuffer, "uint32");
+            pass.drawIndexed(indexCount);
         }
 
-
-        // Wireframe
-        if (settings.showWire) {
-            pass.setPipeline(wirePipeline);
+        if (showWire) {
+            pass.setPipeline(renderer.wirePipeline);
             pass.setBindGroup(0, bindGroup);
-            pass.setIndexBuffer(L.edgeIndexBuffer, "uint32");
-            pass.drawIndexed(L.edgeIndexCount);
+            pass.setIndexBuffer(edgeIndexBuffer, "uint32");
+            pass.drawIndexed(edgeIndexCount);
         }
 
         pass.end();
-
         device.queue.submit([encoder.finish()]);
     }
 
-
-    let frames = 0;
-    let lastTime = performance.now();
-
     function animate() {
         render();
-
-        // FPS 표시 (0.5초마다 갱신)
-        frames++;
-        const now = performance.now();
-        if (now - lastTime >= 500) {
-            $("stat-fps").textContent = Math.round(frames * 1000 / (now - lastTime));
-            frames = 0;
-            lastTime = now;
-        }
-
+        ui.tickFps();
         requestAnimationFrame(animate);
     }
-
-    runSubdivision();
     animate();
 }
-init();
+
+init().catch((err) => console.error("init failed:", err));
