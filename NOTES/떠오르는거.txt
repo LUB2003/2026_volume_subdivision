@@ -1,0 +1,54 @@
+떠오르는거
+
+순서를 어떻게 해야할까
+-> 아마도 레귤러 - 일레귤러
+
+
+1. 원본vtk가 있다
+2. 레귤러한 부분이 있으면 일단 그걸 먼저 그린다
+3. 그리고 이레귤러 데이터 보고 서브디비전
+4 2/3을 반복?
+
+n레벨때 어떤 정보를 보는건지 정리해두기- 버텍스 인덱스 비교하면서~
+-> n-1추정
+
+
+
+질문거리
+1. adjacent_cell_sources는 셀에 인접한 셀인지? / 0번째가 0번셀 정보 이런식?
+2. 버텍스 추가 방식은 뒤에 그냥 추가하는 식인걸까
+3. 
+
+
+
+
+
+----------------------
+인덱스 렌더링 구현기
+
+지금 방금(서브디비전 1번만)
+
+- irregular_topology.json의 level 0 데이터를 보고 서브디비전
+- 그리고 level 1 정보를 보고 인덱싱
+
+--------------------------
+
+에버리지 할 떄 cell들의 cell point 다 구한 버퍼 하나 만들고 거기서 꺼내쓰는게 나을지도
+------------------------
+1012
+에버리지
+1. 바운더리가 아닐 경우
+    - internal vertex index buffer
+    - adjacent cells count buffer
+    - buffer offset buffer
+    - adjacent cells index buffer
+
+2. 바운더리일 경우
+    - boundary vertex index buffer
+    - adjacent faces count buffer
+    - buffer offset buffer
+    - adjacent faces index buffer
+
+
++ boundary_vertices를 그냥
+[idx] [count] [face idx1]... 하는게 나을수도
